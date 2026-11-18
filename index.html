@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>X GIF → WhatsApp Stickers</title>
+<style>
+  :root{--bg:#0e1116;--card:#171b22;--line:#262c36;--fg:#e8ecf1;--mut:#8b95a3;--acc:#25d366;--err:#ff6b6b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,sans-serif}
+  main{max-width:720px;margin:0 auto;padding:24px 16px 80px}
+  h1{font-size:1.5rem;margin:0 0 4px}
+  p.sub{color:var(--mut);margin:0 0 20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:16px}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  input[type=text]{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:10px;padding:12px;font-size:15px}
+  button,label.btn{background:var(--acc);color:#04210f;border:0;border-radius:10px;padding:12px 16px;font-weight:600;font-size:15px;cursor:pointer;display:inline-block}
+  button.sec,label.btn.sec{background:var(--line);color:var(--fg)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  #status{color:var(--mut);font-size:14px;min-height:20px;margin-top:10px}
+  #status.err{color:var(--err)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;margin-top:12px}
+  .st{position:relative;background:
+    conic-gradient(#222 25%,#2b2b2b 0 50%,#222 0 75%,#2b2b2b 0) 0 0/16px 16px;border-radius:10px;aspect-ratio:1;overflow:hidden}
+  .st img{width:100%;height:100%;object-fit:contain}
+  .st small{position:absolute;left:4px;bottom:4px;background:#000a;border-radius:6px;padding:1px 6px;font-size:11px}
+  .st b{position:absolute;right:4px;top:4px;background:#000a;border-radius:50%;width:22px;height:22px;text-align:center;line-height:22px;cursor:pointer}
+  .meta{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}
+  .hint{color:var(--mut);font-size:13px;margin-top:10px}
+  ol{margin:8px 0 0 18px;padding:0;color:var(--mut);font-size:14px}
+</style>
+</head>
+<body>
+<main>
+  <h1>X GIF → WhatsApp Stickers</h1>
+  <p class="sub">Paste an x.com / twitter.com link to a GIF or video. It gets converted to a 512×512 animated WebP.</p>
+
+  <div class="card">
+    <div class="row">
+      <input id="url" type="text" placeholder="https://x.com/user/status/123…/video/1" inputmode="url">
+      <button id="go">Convert</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label class="btn sec">Or upload mp4/gif<input id="file" type="file" accept="video/*,image/gif" hidden></label>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <div class="meta">
+      <input id="title" type="text" placeholder="Pack name" value="My X GIFs">
+      <input id="author" type="text" placeholder="Author" value="Me">
+    </div>
+    <div id="count" style="color:var(--mut);font-size:14px">0 stickers (WhatsApp needs at least 3)</div>
+    <div class="grid" id="grid"></div>
+    <div class="row" style="margin-top:14px">
+      <button id="add" disabled>Add to WhatsApp</button>
+      <button id="dl" class="sec" disabled>Download pack</button>
+      <button id="one" class="sec" disabled>Send last as sticker</button>
+    </div>
+    <ol>
+      <li>Install <b>Sticker Maker</b> (Android) or a similar app that opens <code>.wastickers</code> files.</li>
+      <li>Tap <b>Add to WhatsApp</b>, choose that app in the share sheet (or open the downloaded file with it).</li>
+      <li>In the app, press its “Add to WhatsApp” button.</li>
+    </ol>
+    <div class="hint">Stickers are capped at 500 KB and 8 s. The converter lowers quality/fps until each one fits.</div>
+  </div>
+</main>
+
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const stickers = []; // {blob, url}
+let ffmpeg;
+
+function say(msg, err){ const s=$('status'); s.textContent=msg; s.className=err?'err':''; }
+
+async function getFFmpeg(){
+  if (ffmpeg) return ffmpeg;
+  const { createFFmpeg } = FFmpeg;
+  ffmpeg = createFFmpeg({
+    log:false,
+    corePath:'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js'
+  });
+  say('Loading converter (one-time, ~25 MB)…');
+  try { await ffmpeg.load(); }
+  catch(e){ ffmpeg = null; throw new Error('Converter failed to load ('+(e.message||e)+'). Needs HTTPS hosting and access to unpkg.com; try Chrome if Safari keeps failing.'); }
+  return ffmpeg;
+}
+
+function parseStatusId(u){
+  const m = u.match(/(?:x|twitter)\.com\/(?:[^\/]+|i)\/status\/(\d+)/i) || u.match(/status\/(\d+)/);
+  return m && m[1];
+}
+
+const PROXIES = [
+  u=>'https://corsproxy.io/?url='+encodeURIComponent(u),
+  u=>'https://api.allorigins.win/raw?url='+encodeURIComponent(u),
+  u=>'https://api.codetabs.com/v1/proxy/?quest='+encodeURIComponent(u)
+];
+async function fetchAny(url){
+  let err;
+  try { const r=await fetch(url); if(r.ok) return r; err=new Error('HTTP '+r.status); } catch(e){ err=e; }
+  for (const p of PROXIES){
+    try { const r=await fetch(p(url)); if(r.ok) return r; err=new Error('HTTP '+r.status); } catch(e){ err=e; }
+  }
+  throw err;
+}
+
+async function fetchVideoBlob(link){
+  const id = parseStatusId(link);
+  if(!id) throw new Error('Could not find a tweet ID in that link.');
+  const m = link.match(/\/video\/(\d+)/);
+  const idx = m ? Math.max(0, +m[1]-1) : 0;
+  const um = link.match(/(?:x|twitter)\.com\/([^\/?#]+)\/status/i);
+  const user = um && um[1] !== 'i' ? um[1] : 'i';
+  say('Looking up the post…');
+  let urls = null, lastErr = '';
+  const lookups = [
+    async()=>{ const r=await fetchAny(`https://api.fxtwitter.com/${user}/status/${id}`); const j=await r.json();
+      const md=j.tweet&&j.tweet.media; const v=md&&(md.videos||(md.all||[]).filter(x=>x.type==='video'||x.type==='gif')); return v&&v.map(x=>x.url); },
+    async()=>{ const r=await fetchAny(`https://api.vxtwitter.com/${user}/status/${id}`); const j=await r.json();
+      return (j.media_extended||[]).filter(x=>x.type==='video'||x.type==='gif').map(x=>x.url); }
+  ];
+  for (const f of lookups){
+    try{ const u=await f(); if(u&&u.length){ urls=u; break; } lastErr='No video/GIF found in that post.'; }
+    catch(e){ lastErr='Post lookup failed ('+(e.message||e)+').'; }
+  }
+  if(!urls) throw new Error(lastErr+' If this says "Load failed", your browser/network is blocking the lookup API — use the upload button with a saved mp4.');
+  const url = urls[Math.min(idx, urls.length-1)];
+  say('Downloading video…');
+  let vr;
+  try { vr = await fetchAny(url); } catch(e){ throw new Error('Video download blocked. Save the mp4 and use the upload button instead.'); }
+  return await vr.blob();
+}
+
+async function toWebp(blob){
+  const ff = await getFFmpeg();
+  const inName = 'in.' + (blob.type==='image/gif'?'gif':'mp4');
+  ff.FS('writeFile', inName, await FFmpeg.fetchFile(blob));
+  const tries = [[15,60],[12,45],[10,35],[8,25],[8,15]];
+  for (const [fps,q] of tries){
+    say(`Encoding… (${fps} fps, quality ${q})`);
+    const vf = `fps=${fps},scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000`;
+    await ff.run('-i',inName,'-t','8','-vf',vf,'-c:v','libwebp','-lossless','0',
+      '-q:v',String(q),'-compression_level','6','-loop','0','-an','-vsync','0','out.webp');
+    const data = ff.FS('readFile','out.webp');
+    ff.FS('unlink','out.webp');
+    if (data.length <= 500*1024){ try{ff.FS('unlink',inName);}catch(e){}; return new Blob([data.buffer],{type:'image/webp'}); }
+  }
+  try{ff.FS('unlink',inName);}catch(e){}
+  throw new Error('Could not get this clip under 500 KB. Try a shorter/simpler GIF.');
+}
+
+function render(){
+  const g = $('grid'); g.innerHTML='';
+  stickers.forEach((s,i)=>{
+    const d=document.createElement('div'); d.className='st';
+    d.innerHTML=`<img src="${s.url}" alt=""><small>${Math.round(s.blob.size/1024)} KB</small><b title="Remove">×</b>`;
+    d.querySelector('b').onclick=()=>{URL.revokeObjectURL(s.url);stickers.splice(i,1);render();};
+    g.appendChild(d);
+  });
+  const n=stickers.length;
+  $('count').textContent = `${n} sticker${n===1?'':'s'} (WhatsApp needs at least 3)`;
+  $('add').disabled = $('dl').disabled = n<3;
+  $('one').disabled = n<1;
+}
+
+async function handle(getBlob){
+  $('go').disabled=true;
+  try{
+    const src = await getBlob();
+    const webp = await toWebp(src);
+    stickers.push({blob:webp,url:URL.createObjectURL(webp)});
+    render(); say('Done. Paste another link to add more.');
+  }catch(e){ say(e.message||String(e),true); }
+  $('go').disabled=false;
+}
+
+$('go').onclick = ()=> handle(()=>fetchVideoBlob($('url').value.trim()));
+$('url').addEventListener('keydown',e=>{ if(e.key==='Enter') $('go').click(); });
+$('file').onchange = e=>{ const f=e.target.files[0]; if(f) handle(async()=>f); e.target.value=''; };
+
+async function trayPng(){
+  const img = new Image(); img.src = stickers[0].url; await img.decode();
+  const c = document.createElement('canvas'); c.width=c.height=96;
+  c.getContext('2d').drawImage(img,0,0,96,96);
+  return await new Promise(r=>c.toBlob(r,'image/png'));
+}
+
+async function buildPack(){
+  const zip = new JSZip();
+  zip.file('title.txt', $('title').value.trim() || 'Stickers');
+  zip.file('author.txt', $('author').value.trim() || 'Me');
+  zip.file('tray.png', await trayPng());
+  stickers.forEach((s,i)=>zip.file((i+1)+'.webp', s.blob));
+  const blob = await zip.generateAsync({type:'blob'});
+  return new File([blob], (($('title').value.trim()||'stickers').replace(/[^\w\-]+/g,'_'))+'.wastickers',{type:'application/octet-stream'});
+}
+
+function saveFile(f){
+  const a=document.createElement('a'); a.href=URL.createObjectURL(f); a.download=f.name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+}
+
+$('dl').onclick = async()=> saveFile(await buildPack());
+
+$('add').onclick = async()=>{
+  const f = await buildPack();
+  try{
+    if (navigator.canShare && navigator.canShare({files:[f]})){
+      await navigator.share({files:[f], title:f.name}); return;
+    }
+  }catch(e){ if(e.name==='AbortError') return; }
+  saveFile(f);
+  say('Pack downloaded. Open it with Sticker Maker, then tap its “Add to WhatsApp”.');
+};
+
+$('one').onclick = async()=>{
+  const s = stickers[stickers.length-1];
+  const f = new File([s.blob],'sticker.webp',{type:'image/webp'});
+  try{
+    if (navigator.canShare && navigator.canShare({files:[f]})){ await navigator.share({files:[f]}); return; }
+  }catch(e){ if(e.name==='AbortError') return; }
+  saveFile(f);
+};
+
+render();
+</script>
+</body>
+</html>
