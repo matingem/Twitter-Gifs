@@ -64,12 +64,8 @@
   </div>
 </main>
 
-<script>
-// iOS Safari has no SharedArrayBuffer outside cross-origin isolation. The single-thread
-// ffmpeg core only references it by name, so alias it to ArrayBuffer.
-if (typeof SharedArrayBuffer === 'undefined') { window.SharedArrayBuffer = ArrayBuffer; }
-</script>
-<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+<script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
@@ -80,14 +76,19 @@ function say(msg, err){ const s=$('status'); s.textContent=msg; s.className=err?
 
 async function getFFmpeg(){
   if (ffmpeg) return ffmpeg;
-  const { createFFmpeg } = FFmpeg;
-  ffmpeg = createFFmpeg({
-    log:false,
-    corePath:'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js'
-  });
-  say('Loading converter (one-time, ~25 MB)…');
-  try { await ffmpeg.load(); }
-  catch(e){ ffmpeg = null; throw new Error('Converter failed to load ('+(e.message||e)+'). Needs HTTPS hosting and access to unpkg.com; try Chrome if Safari keeps failing.'); }
+  const f = new FFmpegWASM.FFmpeg();
+  const { toBlobURL } = FFmpegUtil;
+  const W = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/';
+  const C = 'https://unpkg.com/@ffmpeg/core-st@0.12.6/dist/umd/';
+  say('Loading converter (one-time, ~30 MB)…');
+  try {
+    await f.load({
+      classWorkerURL: await toBlobURL(W+'814.ffmpeg.js','text/javascript'),
+      coreURL: await toBlobURL(C+'ffmpeg-core.js','text/javascript'),
+      wasmURL: await toBlobURL(C+'ffmpeg-core.wasm','application/wasm'),
+    });
+  } catch(e){ throw new Error('Converter failed to load ('+(e.message||e)+').'); }
+  ffmpeg = f;
   return ffmpeg;
 }
 
@@ -157,18 +158,19 @@ async function fetchVideoBlob(link){
 async function toWebp(blob){
   const ff = await getFFmpeg();
   const inName = 'in.' + (blob.type==='image/gif'?'gif':'mp4');
-  ff.FS('writeFile', inName, await FFmpeg.fetchFile(blob));
+  await ff.writeFile(inName, await FFmpegUtil.fetchFile(blob));
   const tries = [[15,60],[12,45],[10,35],[8,25],[8,15]];
   for (const [fps,q] of tries){
     say(`Encoding… (${fps} fps, quality ${q})`);
     const vf = `fps=${fps},scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000`;
-    await ff.run('-i',inName,'-t','8','-vf',vf,'-c:v','libwebp','-lossless','0',
-      '-q:v',String(q),'-compression_level','6','-loop','0','-an','-vsync','0','out.webp');
-    const data = ff.FS('readFile','out.webp');
-    ff.FS('unlink','out.webp');
-    if (data.length <= 500*1024){ try{ff.FS('unlink',inName);}catch(e){}; return new Blob([data.buffer],{type:'image/webp'}); }
+    const code = await ff.exec(['-i',inName,'-t','8','-vf',vf,'-c:v','libwebp','-lossless','0',
+      '-q:v',String(q),'-compression_level','6','-loop','0','-an','-vsync','0','out.webp']);
+    if (code !== 0) throw new Error('Encoder failed (exit '+code+'). This ffmpeg build may lack WebP support.');
+    const data = await ff.readFile('out.webp');
+    await ff.deleteFile('out.webp');
+    if (data.length <= 500*1024){ try{await ff.deleteFile(inName);}catch(e){}; return new Blob([data],{type:'image/webp'}); }
   }
-  try{ff.FS('unlink',inName);}catch(e){}
+  try{await ff.deleteFile(inName);}catch(e){}
   throw new Error('Could not get this clip under 500 KB. Try a shorter/simpler GIF.');
 }
 
